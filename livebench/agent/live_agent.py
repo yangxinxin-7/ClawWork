@@ -30,6 +30,7 @@ from prompts.live_agent_prompt import (
     STOP_SIGNAL
 )
 from livebench.utils.logger import LiveBenchLogger, set_global_logger
+from agent.openviking_memory_recall import recall_task_memory_block
 
 # Load environment variables
 load_dotenv()
@@ -61,6 +62,7 @@ class LiveAgent:
         max_retries: int = 5,
         base_delay: float = 1.0,
         api_timeout: float = 60.0,
+        max_tokens: int = 65536,
         openai_base_url: Optional[str] = None,
         # New task source parameters
         task_source_type: str = "parquet",
@@ -113,6 +115,7 @@ class LiveAgent:
         self.max_retries = max_retries
         self.base_delay = base_delay
         self.api_timeout = api_timeout
+        self.max_tokens = max_tokens
         self.tasks_per_day = tasks_per_day
         self.supports_multimodal = supports_multimodal
 
@@ -233,6 +236,7 @@ class LiveAgent:
             base_url=self.openai_base_url,
             max_retries=3,
             timeout=self.api_timeout,
+            max_tokens=self.max_tokens,
             http_client=http_client_sync,
             http_async_client=http_client_async
         )
@@ -390,6 +394,35 @@ class LiveAgent:
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
 
+    def _get_trajectory_file(self, task_id: str) -> Path:
+        repo_root = Path(project_root).parent
+        recall_memory = os.getenv("RECALL_MEMORY", "false").strip().lower() in {"1", "true", "yes", "on"}
+        trajectory_dir = repo_root / ("trajectory_with" if recall_memory else "trajectory")
+        trajectory_dir.mkdir(parents=True, exist_ok=True)
+        return trajectory_dir / f"{task_id}.json"
+
+    def _json_safe(self, value: Any) -> Any:
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, bytes):
+            return f"<bytes:{len(value)}>"
+        if isinstance(value, list):
+            return [self._json_safe(v) for v in value]
+        if isinstance(value, dict):
+            return {str(k): self._json_safe(v) for k, v in value.items()}
+        return str(value)
+
+    def _append_trajectory_run(
+        self,
+        task_id: str,
+        llm_messages: List[Dict[str, Any]],
+    ) -> None:
+        trajectory_file = self._get_trajectory_file(task_id)
+        trajectory_file.write_text(
+            json.dumps(self._json_safe(llm_messages), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
     async def _ainvoke_with_retry(self, messages: List[Dict[str, str]], timeout: float = 120.0) -> Any:
         """
         Agent invocation with retry, timeout, and token tracking
@@ -421,7 +454,19 @@ class LiveAgent:
                     if role == "system":
                         lc_messages.append(SystemMessage(content=content))
                     elif role == "assistant" or role == "ai":
-                        lc_messages.append(AIMessage(content=content))
+                        tool_calls = msg.get("tool_calls")
+                        if tool_calls:
+                            lc_messages.append(AIMessage(content=content, tool_calls=tool_calls))
+                        else:
+                            lc_messages.append(AIMessage(content=content))
+                    elif role == "tool":
+                        from langchain_core.messages import ToolMessage
+                        tool_call_id = msg.get("tool_call_id", "")
+                        if isinstance(content, list):
+                            # Multimodal tool result — fall back to HumanMessage
+                            lc_messages.append(HumanMessage(content=content))
+                        else:
+                            lc_messages.append(ToolMessage(content=content, tool_call_id=tool_call_id))
                     else:  # user or human
                         # LangChain HumanMessage can accept both string and list[dict] content
                         lc_messages.append(HumanMessage(content=content))
@@ -568,6 +613,7 @@ class LiveAgent:
         self.last_evaluation_score = 0.0
         self.last_work_submitted = False
         session_api_error = False
+        llm_messages: List[Dict[str, Any]] = []
 
         # Check if bankrupt
         if self.economic_tracker.is_bankrupt():
@@ -687,10 +733,47 @@ class LiveAgent:
         self.agent = self.model.bind_tools(self.tools)
 
         # Initial messages
+        base_first_user_message = f"Today is {date}. Analyze your situation and decide your activity."
+
+        recall_memory = os.getenv("RECALL_MEMORY", "false").strip().lower() in {"1", "true", "yes", "on"}
+        recall_top_k = int(os.getenv("RECALL_MEMORY_TOP_K", "5"))
+        recall_query = os.getenv("RECALL_MEMORY_QUERY", "").strip()
+        print(f"[DEBUG] RECALL_MEMORY={os.getenv('RECALL_MEMORY')!r} recall_memory={recall_memory} current_task={bool(self.current_task)}")
+        first_user_message = base_first_user_message
+        if recall_memory and self.current_task:
+            task_id = str(self.current_task.get("task_id", "")).strip()
+            if task_id:
+                if not recall_query:
+                    recall_query = (
+                        f"task_id {task_id} "
+                        f"{self.current_task.get('sector', '')} "
+                        f"{self.current_task.get('occupation', '')}"
+                    ).strip()
+
+                import asyncio
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=1) as _pool:
+                    memory_block = await asyncio.get_event_loop().run_in_executor(
+                        _pool,
+                        lambda: recall_task_memory_block(
+                            task_id=task_id,
+                            query=recall_query,
+                            top_k=recall_top_k,
+                            logger=self.logger,
+                        ),
+                    )
+                print(f"[DEBUG] memory_block empty={not memory_block}")
+                if memory_block:
+                    first_user_message = f"{memory_block}\n\n{base_first_user_message}"
+
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Today is {date}. Analyze your situation and decide your activity."}
+            {"role": "user", "content": first_user_message}
         ]
+        llm_messages.extend([
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": first_user_message},
+        ])
 
         self._log_message(log_file, messages)
 
@@ -747,8 +830,13 @@ class LiveAgent:
                 if hasattr(response, 'tool_calls') and response.tool_calls:
                     self.logger.terminal_print(f"🔧 Tool calls: {len(response.tool_calls)}")
 
-                    # Add AI message
-                    messages.append({"role": "assistant", "content": agent_response})
+                    assistant_msg = {
+                        "role": "assistant",
+                        "content": agent_response,
+                        "tool_calls": response.tool_calls,
+                    }
+                    llm_messages.append(assistant_msg)
+                    messages.append(assistant_msg)
 
                     # Execute each tool call
                     for tool_call in response.tool_calls:
@@ -793,11 +881,26 @@ class LiveAgent:
                         elif tool_name == 'learn' and 'success' in str(tool_result).lower():
                             activity_completed = True
 
+                        tool_call_id = tool_call.get('id') or tool_call.get('tool_call_id')
+
                         # Add tool result to messages (handle multimodal content)
                         tool_message = format_tool_result_message(
                             tool_name, tool_result, tool_args, activity_completed
                         )
+                        # Attach tool_call_id so _ainvoke_with_retry can emit proper ToolMessage
+                        if tool_call_id:
+                            tool_message = dict(tool_message)
+                            tool_message["role"] = "tool"
+                            tool_message["tool_call_id"] = tool_call_id
+                            tool_message["name"] = tool_name
                         messages.append(tool_message)
+
+                        llm_messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call_id,
+                            "name": tool_name,
+                            "content": json.dumps(self._json_safe(tool_result), ensure_ascii=False),
+                        })
                     # If activity is completed, stop the loop
                     if activity_completed:
                         self.logger.terminal_print(f"\n✅ Activity completed successfully!")
@@ -806,18 +909,19 @@ class LiveAgent:
                     # Continue loop to get next response
                     continue
 
-                # No tool calls - nudge agent to keep working if it hasn't submitted
+                # No tool calls
+                llm_messages.append({"role": "assistant", "content": agent_response})
+
+                # Nudge agent to keep working if it hasn't submitted
                 if not activity_completed and iteration < max_iterations - 1:
                     messages.append({"role": "assistant", "content": agent_response})
                     nudge = (
-                        "STOP! Do NOT explain code in text. You MUST use tool calls.\n"
-                        "Call execute_code_sandbox with your Python code NOW. Example:\n"
-                        "Tool: execute_code_sandbox\n"
-                        'Args: {"code": "from reportlab.lib.pagesizes import letter\\n..."}\n\n'
-                        "Do NOT write code in your message. CALL execute_code_sandbox directly.\n"
-                        "After creating files, call submit_work with the artifact paths."
+                        "You must make a tool call now. "
+                        "Do not output any text — use execute_code to run your code, "
+                        "or submit_work if you have already generated the artifact files."
                     )
                     messages.append({"role": "user", "content": nudge})
+                    llm_messages.append({"role": "user", "content": nudge})
                     self.logger.terminal_print(
                         f"\n   [NUDGE] Agent stopped without submitting, forcing retry..."
                     )
@@ -927,7 +1031,21 @@ class LiveAgent:
             trading_profit=self.daily_trading_profit,
             api_error=session_api_error
         )
-        
+
+        # Save full conversation trajectory by task_id
+        if self.current_task and self.current_task.get("task_id"):
+            try:
+                self._append_trajectory_run(
+                    task_id=self.current_task["task_id"],
+                    llm_messages=llm_messages,
+                )
+            except Exception as e:
+                self.logger.warning(
+                    f"Failed to save trajectory: {str(e)}",
+                    context={"date": date, "task_id": self.current_task.get('task_id')},
+                    print_console=False
+                )
+
         # Clean up sandbox session for this day
         try:
             from livebench.tools.productivity.code_execution_sandbox import cleanup_session_sandbox

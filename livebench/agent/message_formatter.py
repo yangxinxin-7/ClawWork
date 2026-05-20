@@ -107,6 +107,26 @@ def _format_image_message(
     return {"role": "user", "content": content}
 
 
+_MAX_STDOUT = 3000
+_MAX_STDERR = 2000
+_MAX_TOTAL  = 6000
+
+
+def _truncate_tool_result(result: Any) -> Any:
+    """Truncate stdout/stderr fields so model context stays manageable."""
+    import json as _json
+    if not isinstance(result, dict):
+        s = str(result)
+        return s[:_MAX_TOTAL] + "... [truncated]" if len(s) > _MAX_TOTAL else s
+
+    r = dict(result)
+    if "stdout" in r and isinstance(r["stdout"], str) and len(r["stdout"]) > _MAX_STDOUT:
+        r["stdout"] = r["stdout"][:_MAX_STDOUT] + "... [truncated]"
+    if "stderr" in r and isinstance(r["stderr"], str) and len(r["stderr"]) > _MAX_STDERR:
+        r["stderr"] = r["stderr"][:_MAX_STDERR] + "... [truncated]"
+    return r
+
+
 def _format_text_message(
     tool_name: str,
     tool_result: Any,
@@ -114,7 +134,13 @@ def _format_text_message(
     activity_completed: bool
 ) -> Dict[str, str]:
     """Format regular text tool result"""
-    tool_result_message = f"Tool result: {tool_result}"
+    import json as _json
+    truncated = _truncate_tool_result(tool_result)
+    if isinstance(truncated, (dict, list)):
+        result_str = _json.dumps(truncated, ensure_ascii=False)
+    else:
+        result_str = str(truncated)
+    tool_result_message = f"Tool result: {result_str}"
     
     if tool_name == 'decide_activity' and 'work' in str(tool_args).lower():
         tool_result_message += "\n\nYou decided to WORK. Complete it now!"

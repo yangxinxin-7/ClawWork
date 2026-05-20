@@ -34,17 +34,27 @@ if [ -n "$EXHAUST_FLAG" ]; then
 fi
 echo ""
 
-# Activate conda environment
-echo "🔧 Activating livebench conda environment..."
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate livebench
+# Activate venv environment
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV_ACTIVATE="$SCRIPT_DIR/.venv/bin/activate"
+if [ ! -f "$VENV_ACTIVATE" ]; then
+    echo "❌ .venv not found at $SCRIPT_DIR/.venv"
+    echo "   Create it with: python3 -m venv .venv && .venv/bin/pip install -e ."
+    exit 1
+fi
+echo "🔧 Activating .venv environment..."
+source "$VENV_ACTIVATE"
 echo "   Using Python: $(which python)"
 echo ""
 
 # Load environment variables from .env if it exists
+# Command-line env vars (e.g. RECALL_MEMORY=false bash run_test_agent.sh) take priority over .env
 if [ -f ".env" ]; then
     echo "📝 Loading environment variables from .env..."
-    source .env
+    _pre_env=$(export -p)          # snapshot vars already set before sourcing
+    set -a; source .env; set +a
+    eval "$_pre_env" 2>/dev/null   # restore pre-existing vars so they override .env
+    unset _pre_env
     echo ""
 fi
 
@@ -80,7 +90,7 @@ echo "✓ WEB_SEARCH_API_KEY set"
 
 # Resolve sandbox provider (explicit e2b default, optional boxlite)
 SANDBOX_PROVIDER_REQUESTED=${CODE_SANDBOX_PROVIDER:-e2b}
-SANDBOX_PROVIDER_RESOLVED=$(python - <<'PY'
+SANDBOX_PROVIDER_RESOLVED=$(python3 - <<'PY'
 import os
 import importlib.util
 
@@ -139,14 +149,23 @@ echo ""
 export LIVEBENCH_HTTP_PORT=${LIVEBENCH_HTTP_PORT:-8010}
 
 # Add project root to PYTHONPATH to ensure imports work
-export PYTHONPATH="/root/-Live-Bench:$PYTHONPATH"
+export PYTHONPATH="$SCRIPT_DIR:$PYTHONPATH"
 
-# Extract agent info from config (basic parsing)
-AGENT_NAME=$(grep -oP '"signature"\s*:\s*"\K[^"]+' "$CONFIG_FILE" | head -1)
-BASEMODEL=$(grep -oP '"basemodel"\s*:\s*"\K[^"]+' "$CONFIG_FILE" | head -1)
-INIT_DATE=$(grep -oP '"init_date"\s*:\s*"\K[^"]+' "$CONFIG_FILE" | head -1)
-END_DATE=$(grep -oP '"end_date"\s*:\s*"\K[^"]+' "$CONFIG_FILE" | head -1)
-INITIAL_BALANCE=$(grep -oP '"initial_balance"\s*:\s*\K[0-9.]+' "$CONFIG_FILE" | head -1)
+# Extract agent info from config (using python for cross-platform JSON parsing)
+read AGENT_NAME BASEMODEL INIT_DATE END_DATE INITIAL_BALANCE <<< $(python3 - "$CONFIG_FILE" <<'PY'
+import sys, json
+with open(sys.argv[1]) as f:
+    c = json.load(f)["livebench"]
+agents = c.get("agents", [{}])
+print(
+    agents[0].get("signature", ""),
+    agents[0].get("basemodel", ""),
+    c.get("date_range", {}).get("init_date", ""),
+    c.get("date_range", {}).get("end_date", ""),
+    c.get("economic", {}).get("initial_balance", ""),
+)
+PY
+)
 
 echo "===================================="
 echo "🤖 Running Agent"
@@ -175,7 +194,7 @@ echo "===================================="
 echo ""
 
 # Run the agent with specified config (and optional --exhaust flag)
-python livebench/main.py "$CONFIG_FILE" $EXHAUST_FLAG
+PYTHONUNBUFFERED=1 python livebench/main.py "$CONFIG_FILE" $EXHAUST_FLAG
 
 echo ""
 echo "===================================="
